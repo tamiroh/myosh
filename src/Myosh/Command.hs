@@ -8,6 +8,7 @@ import Control.Exception (IOException, catch)
 import System.Directory (setCurrentDirectory)
 import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)
+import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
 import System.Process (rawSystem)
 
 data Command
@@ -66,5 +67,11 @@ reportExitCode (ExitFailure code) =
 
 reportError :: String -> IOException -> IO CommandResult
 reportError context err = do
-  hPutStrLn stderr (context ++ ": " ++ show err)
+  hPutStrLn stderr (context ++ ": " ++ formatError err)
   pure Continue
+
+formatError :: IOException -> String
+formatError err =
+  if isDoesNotExistError err
+    then "command not found"
+    else ioeGetErrorString err
