@@ -4,17 +4,24 @@ module Myosh.Shell
 where
 
 import Myosh.Command (CommandResult (..), runCommand)
-import System.IO (hFlush, isEOF, stdout)
+import Control.Monad.IO.Class (liftIO)
+import System.Console.Haskeline
+  ( InputT,
+    defaultSettings,
+    getInputLine,
+    runInputT,
+  )
 
 runShell :: IO ()
-runShell = do
-  putStr "myosh> "
-  hFlush stdout
-  done <- isEOF
-  if done
-    then putStrLn ""
-    else do
-      result <- getLine >>= runCommand
+runShell = runInputT defaultSettings shellLoop
+
+shellLoop :: InputT IO ()
+shellLoop = do
+  input <- getInputLine "myosh> "
+  case input of
+    Nothing -> pure ()
+    Just line -> do
+      result <- liftIO (runCommand line)
       case result of
-        Continue -> runShell
+        Continue -> shellLoop
         Stop -> pure ()
