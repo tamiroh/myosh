@@ -16,15 +16,29 @@ import Control.Exception
   )
 import System.Directory (getCurrentDirectory, getHomeDirectory, setCurrentDirectory)
 import System.Exit (ExitCode (..))
-import System.IO (hPutStrLn, stderr)
+import System.IO (Handle, hClose, hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
-import System.Process (rawSystem)
+import System.Process
+  ( StdStream (..),
+    ProcessHandle,
+    createProcess,
+    proc,
+    rawSystem,
+    std_in,
+    std_out,
+    waitForProcess,
+  )
 
 data Command
   = Empty
   | Exit
   | ChangeDirectory DirectoryTarget
   | Run FilePath [String]
+  | Pipeline [ProcessCommand]
+  | Invalid String
+  deriving (Eq, Show)
+
+data ProcessCommand = ProcessCommand FilePath [String]
   deriving (Eq, Show)
 
 data DirectoryTarget
@@ -51,7 +65,17 @@ runCommand state input = executeCommand state (parseCommand input)
 
 parseCommand :: String -> Command
 parseCommand input =
-  case words input of
+  case splitPipeline (words input) of
+    [] -> Empty
+    [tokens] -> parseBuiltinCommand tokens
+    tokensByCommand ->
+      if any null tokensByCommand
+        then Invalid "syntax error near unexpected token `|'"
+        else Pipeline (map parseProcessCommand tokensByCommand)
+
+parseBuiltinCommand :: [String] -> Command
+parseBuiltinCommand tokens =
+  case tokens of
     [] -> Empty
     ["exit"] -> Exit
     ["cd"] -> ChangeDirectory HomeDirectory
@@ -60,6 +84,19 @@ parseCommand input =
     "cd" : _ -> Run "cd" []
     command : arguments -> Run command arguments
 
+parseProcessCommand :: [String] -> ProcessCommand
+parseProcessCommand [] = ProcessCommand "" []
+parseProcessCommand (command : arguments) = ProcessCommand command arguments
+
+splitPipeline :: [String] -> [[String]]
+splitPipeline =
+  foldr splitToken [[]]
+
+splitToken :: String -> [[String]] -> [[String]]
+splitToken "|" commands = [] : commands
+splitToken token [] = [[token]]
+splitToken token (command : commands) = (token : command) : commands
+
 executeCommand :: ShellState -> Command -> IO CommandResult
 executeCommand state Empty = runEmptyCommand state
 executeCommand _ Exit = runExitCommand
@@ -67,12 +104,19 @@ executeCommand state (ChangeDirectory target) =
   runChangeDirectoryCommand state target
 executeCommand state (Run command arguments) =
   runExternalCommand state command arguments
+executeCommand state (Pipeline commands) = runPipelineCommand state commands
+executeCommand state (Invalid message) = runInvalidCommand state message
 
 runEmptyCommand :: ShellState -> IO CommandResult
 runEmptyCommand state = pure (Continue state)
 
 runExitCommand :: IO CommandResult
 runExitCommand = pure Stop
+
+runInvalidCommand :: ShellState -> String -> IO CommandResult
+runInvalidCommand state message = do
+  hPutStrLn stderr message
+  pure (Continue state)
 
 runChangeDirectoryCommand :: ShellState -> DirectoryTarget -> IO CommandResult
 runChangeDirectoryCommand state target =
@@ -96,6 +140,45 @@ runExternalCommand state command arguments =
         (continueAfterError state command)
     )
     (continueAfterInterrupt state)
+
+runPipelineCommand :: ShellState -> [ProcessCommand] -> IO CommandResult
+runPipelineCommand state commands =
+  catch
+    ( catch
+        (runPipeline commands >>= mapM_ reportExitCode >> pure (Continue state))
+        (continueAfterError state "pipeline")
+    )
+    (continueAfterInterrupt state)
+
+runPipeline :: [ProcessCommand] -> IO [ExitCode]
+runPipeline commands =
+  startPipeline Nothing commands >>= mapM waitForProcess
+
+startPipeline :: Maybe Handle -> [ProcessCommand] -> IO [ProcessHandle]
+startPipeline _ [] = pure []
+startPipeline inputHandle [ProcessCommand command arguments] = do
+  (_, _, _, processHandle) <-
+    createProcess
+      (proc command arguments)
+        { std_in = maybe Inherit UseHandle inputHandle
+        }
+  closeInputHandle inputHandle
+  pure [processHandle]
+startPipeline inputHandle (ProcessCommand command arguments : commands) = do
+  (_, outputHandle, _, processHandle) <-
+    createProcess
+      (proc command arguments)
+        { std_in = maybe Inherit UseHandle inputHandle,
+          std_out = CreatePipe
+        }
+  closeInputHandle inputHandle
+  case outputHandle of
+    Nothing -> pure [processHandle]
+    Just handle -> (processHandle :) <$> startPipeline (Just handle) commands
+
+closeInputHandle :: Maybe Handle -> IO ()
+closeInputHandle Nothing = pure ()
+closeInputHandle (Just handle) = hClose handle
 
 changeDirectory :: ShellState -> FilePath -> Bool -> IO CommandResult
 changeDirectory state path printPath =
