@@ -20,6 +20,10 @@ import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
 
+--------------------------------------------------------------------------------
+-- Command Model
+--------------------------------------------------------------------------------
+
 data Command
   = Empty
   | Exit
@@ -47,6 +51,10 @@ data CommandResult
 
 initialShellState :: ShellState
 initialShellState = ShellState {previousDirectory = Nothing}
+
+--------------------------------------------------------------------------------
+-- Command Line Parsing
+--------------------------------------------------------------------------------
 
 runCommand :: ShellState -> String -> IO CommandResult
 runCommand state input = executeCommand state (parseCommand input)
@@ -85,6 +93,10 @@ splitToken "|" commands = [] : commands
 splitToken token [] = [[token]]
 splitToken token (command : commands) = (token : command) : commands
 
+--------------------------------------------------------------------------------
+-- Command Dispatch
+--------------------------------------------------------------------------------
+
 executeCommand :: ShellState -> Command -> IO CommandResult
 executeCommand state Empty = runEmptyCommand state
 executeCommand _ Exit = runExitCommand
@@ -95,16 +107,32 @@ executeCommand state (Run command arguments) =
 executeCommand state (Pipeline commands) = runPipelineCommand state commands
 executeCommand state (Invalid message) = runInvalidCommand state message
 
+--------------------------------------------------------------------------------
+-- Command / Empty
+--------------------------------------------------------------------------------
+
 runEmptyCommand :: ShellState -> IO CommandResult
 runEmptyCommand state = pure (Continue state)
 
+--------------------------------------------------------------------------------
+-- Command / Exit
+--------------------------------------------------------------------------------
+
 runExitCommand :: IO CommandResult
 runExitCommand = pure Stop
+
+--------------------------------------------------------------------------------
+-- Command / Invalid
+--------------------------------------------------------------------------------
 
 runInvalidCommand :: ShellState -> String -> IO CommandResult
 runInvalidCommand state message = do
   hPutStrLn stderr message
   pure (Continue state)
+
+--------------------------------------------------------------------------------
+-- Command / Change Directory
+--------------------------------------------------------------------------------
 
 runChangeDirectoryCommand :: ShellState -> DirectoryTarget -> IO CommandResult
 runChangeDirectoryCommand state target =
@@ -120,24 +148,6 @@ runChangeDirectoryCommand state target =
     DirectoryPath path ->
       changeDirectory state path False
 
-runExternalCommand :: ShellState -> FilePath -> [String] -> IO CommandResult
-runExternalCommand state command arguments =
-  catch
-    ( catch
-        (runProcess (ProcessCommand command arguments) >>= reportExitCode >> pure (Continue state))
-        (continueAfterError state command)
-    )
-    (continueAfterInterrupt state)
-
-runPipelineCommand :: ShellState -> [ProcessCommand] -> IO CommandResult
-runPipelineCommand state commands =
-  catch
-    ( catch
-        (runPipeline commands >>= mapM_ reportExitCode >> pure (Continue state))
-        (continueAfterError state "pipeline")
-    )
-    (continueAfterInterrupt state)
-
 changeDirectory :: ShellState -> FilePath -> Bool -> IO CommandResult
 changeDirectory state path printPath =
   catch
@@ -151,10 +161,44 @@ changeDirectory state path printPath =
     )
     (continueAfterError state path)
 
+--------------------------------------------------------------------------------
+-- Command / External Process
+--------------------------------------------------------------------------------
+
+runExternalCommand :: ShellState -> FilePath -> [String] -> IO CommandResult
+runExternalCommand state command arguments =
+  catch
+    ( catch
+        (runProcess (ProcessCommand command arguments) >>= reportExitCode >> pure (Continue state))
+        (continueAfterError state command)
+    )
+    (continueAfterInterrupt state)
+
+--------------------------------------------------------------------------------
+-- Command / Pipeline
+--------------------------------------------------------------------------------
+
+runPipelineCommand :: ShellState -> [ProcessCommand] -> IO CommandResult
+runPipelineCommand state commands =
+  catch
+    ( catch
+        (runPipeline commands >>= mapM_ reportExitCode >> pure (Continue state))
+        (continueAfterError state "pipeline")
+    )
+    (continueAfterInterrupt state)
+
+--------------------------------------------------------------------------------
+-- Exit Status Reporting
+--------------------------------------------------------------------------------
+
 reportExitCode :: ExitCode -> IO ()
 reportExitCode ExitSuccess = pure ()
 reportExitCode (ExitFailure code) =
   hPutStrLn stderr ("Exited with status " ++ show code)
+
+--------------------------------------------------------------------------------
+-- Error Handling
+--------------------------------------------------------------------------------
 
 continueAfterError :: ShellState -> String -> IOException -> IO CommandResult
 continueAfterError state context err = do
