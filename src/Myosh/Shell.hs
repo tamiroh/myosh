@@ -3,7 +3,12 @@ module Myosh.Shell
   )
 where
 
-import Myosh.Command (CommandResult (..), runCommand)
+import Myosh.Command
+  ( CommandResult (..),
+    ShellState,
+    initialShellState,
+    runCommand,
+  )
 import Control.Monad.IO.Class (liftIO)
 import System.Console.Haskeline
   ( InputT,
@@ -13,15 +18,15 @@ import System.Console.Haskeline
   )
 
 runShell :: IO ()
-runShell = runInputT defaultSettings shellLoop
+runShell = runInputT defaultSettings (shellLoop initialShellState)
 
-shellLoop :: InputT IO ()
-shellLoop = do
+shellLoop :: ShellState -> InputT IO ()
+shellLoop state = do
   input <- getInputLine "myosh> "
   case input of
     Nothing -> pure ()
     Just line -> do
-      result <- liftIO (runCommand line)
+      result <- liftIO (runCommand state line)
       case result of
-        Continue -> shellLoop
+        Continue nextState -> shellLoop nextState
         Stop -> pure ()

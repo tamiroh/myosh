@@ -1,11 +1,15 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module Myosh.Command
   ( CommandResult (..),
+    ShellState (..),
+    initialShellState,
     runCommand,
   )
 where
 
 import Control.Exception (IOException, catch)
-import System.Directory (setCurrentDirectory)
+import System.Directory (getCurrentDirectory, getHomeDirectory, setCurrentDirectory)
 import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
@@ -14,61 +18,103 @@ import System.Process (rawSystem)
 data Command
   = Empty
   | Exit
-  | ChangeDirectory FilePath
+  | ChangeDirectory DirectoryTarget
   | Run FilePath [String]
   deriving (Eq, Show)
 
+data DirectoryTarget
+  = HomeDirectory
+  | PreviousDirectory
+  | DirectoryPath FilePath
+  deriving (Eq, Show)
+
+newtype ShellState = ShellState
+  { previousDirectory :: Maybe FilePath
+  }
+  deriving (Eq, Show)
+
 data CommandResult
-  = Continue
+  = Continue ShellState
   | Stop
   deriving (Eq, Show)
 
-runCommand :: String -> IO CommandResult
-runCommand input = executeCommand (parseCommand input)
+initialShellState :: ShellState
+initialShellState = ShellState {previousDirectory = Nothing}
+
+runCommand :: ShellState -> String -> IO CommandResult
+runCommand state input = executeCommand state (parseCommand input)
 
 parseCommand :: String -> Command
 parseCommand input =
   case words input of
     [] -> Empty
     ["exit"] -> Exit
-    ["cd"] -> ChangeDirectory "."
-    ["cd", path] -> ChangeDirectory path
+    ["cd"] -> ChangeDirectory HomeDirectory
+    ["cd", "-"] -> ChangeDirectory PreviousDirectory
+    ["cd", path] -> ChangeDirectory (DirectoryPath path)
     "cd" : _ -> Run "cd" []
     command : arguments -> Run command arguments
 
-executeCommand :: Command -> IO CommandResult
-executeCommand Empty = runEmptyCommand
-executeCommand Exit = runExitCommand
-executeCommand (ChangeDirectory path) = runChangeDirectoryCommand path
-executeCommand (Run command arguments) = runExternalCommand command arguments
+executeCommand :: ShellState -> Command -> IO CommandResult
+executeCommand state Empty = runEmptyCommand state
+executeCommand _ Exit = runExitCommand
+executeCommand state (ChangeDirectory target) =
+  runChangeDirectoryCommand state target
+executeCommand state (Run command arguments) =
+  runExternalCommand state command arguments
 
-runEmptyCommand :: IO CommandResult
-runEmptyCommand = pure Continue
+runEmptyCommand :: ShellState -> IO CommandResult
+runEmptyCommand state = pure (Continue state)
 
 runExitCommand :: IO CommandResult
 runExitCommand = pure Stop
 
-runChangeDirectoryCommand :: FilePath -> IO CommandResult
-runChangeDirectoryCommand path =
-  catch
-    (setCurrentDirectory path >> pure Continue)
-    (reportError path)
+runChangeDirectoryCommand :: ShellState -> DirectoryTarget -> IO CommandResult
+runChangeDirectoryCommand state target =
+  case target of
+    PreviousDirectory ->
+      case state.previousDirectory of
+        Nothing -> do
+          hPutStrLn stderr "cd: OLDPWD not set"
+          pure (Continue state)
+        Just path -> changeDirectory state path True
+    HomeDirectory ->
+      getHomeDirectory >>= \path -> changeDirectory state path False
+    DirectoryPath path ->
+      changeDirectory state path False
 
-runExternalCommand :: FilePath -> [String] -> IO CommandResult
-runExternalCommand command arguments =
+runExternalCommand :: ShellState -> FilePath -> [String] -> IO CommandResult
+runExternalCommand state command arguments =
   catch
-    (rawSystem command arguments >>= reportExitCode >> pure Continue)
-    (reportError command)
+    (rawSystem command arguments >>= reportExitCode >> pure (Continue state))
+    (continueAfterError state command)
+
+changeDirectory :: ShellState -> FilePath -> Bool -> IO CommandResult
+changeDirectory state path printPath =
+  catch
+    ( do
+        currentDirectory <- getCurrentDirectory
+        setCurrentDirectory path
+        if printPath
+          then putStrLn path
+          else pure ()
+        pure (Continue state {previousDirectory = Just currentDirectory})
+    )
+    (continueAfterError state path)
 
 reportExitCode :: ExitCode -> IO ()
 reportExitCode ExitSuccess = pure ()
 reportExitCode (ExitFailure code) =
   hPutStrLn stderr ("Exited with status " ++ show code)
 
-reportError :: String -> IOException -> IO CommandResult
-reportError context err = do
+continueAfterError :: ShellState -> String -> IOException -> IO CommandResult
+continueAfterError state context err = do
+  reportError context err
+  pure (Continue state)
+
+reportError :: String -> IOException -> IO ()
+reportError context err =
   hPutStrLn stderr (context ++ ": " ++ formatError err)
-  pure Continue
 
 formatError :: IOException -> String
 formatError err =
