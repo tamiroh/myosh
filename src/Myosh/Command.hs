@@ -8,7 +8,12 @@ module Myosh.Command
   )
 where
 
-import Control.Exception (IOException, catch)
+import Control.Exception
+  ( AsyncException (UserInterrupt),
+    IOException,
+    catch,
+    throwIO,
+  )
 import System.Directory (getCurrentDirectory, getHomeDirectory, setCurrentDirectory)
 import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)
@@ -86,8 +91,11 @@ runChangeDirectoryCommand state target =
 runExternalCommand :: ShellState -> FilePath -> [String] -> IO CommandResult
 runExternalCommand state command arguments =
   catch
-    (rawSystem command arguments >>= reportExitCode >> pure (Continue state))
-    (continueAfterError state command)
+    ( catch
+        (rawSystem command arguments >>= reportExitCode >> pure (Continue state))
+        (continueAfterError state command)
+    )
+    (continueAfterInterrupt state)
 
 changeDirectory :: ShellState -> FilePath -> Bool -> IO CommandResult
 changeDirectory state path printPath =
@@ -111,6 +119,10 @@ continueAfterError :: ShellState -> String -> IOException -> IO CommandResult
 continueAfterError state context err = do
   reportError context err
   pure (Continue state)
+
+continueAfterInterrupt :: ShellState -> AsyncException -> IO CommandResult
+continueAfterInterrupt state UserInterrupt = pure (Continue state)
+continueAfterInterrupt _ err = throwIO err
 
 reportError :: String -> IOException -> IO ()
 reportError context err =
