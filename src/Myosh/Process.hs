@@ -1,18 +1,21 @@
 module Myosh.Process
   ( ProcessCommand (..),
+    captureCommandOutput,
+    captureProcess,
     runPipeline,
     runProcess,
   )
 where
 
-import System.Exit (ExitCode)
-import System.IO (Handle, hClose)
+import System.Exit (ExitCode (..))
+import System.IO (Handle, hClose, hPutStr, stderr)
 import System.Process
   ( ProcessHandle,
     StdStream (..),
     createProcess,
     proc,
     rawSystem,
+    readCreateProcessWithExitCode,
     std_in,
     std_out,
     waitForProcess,
@@ -24,6 +27,21 @@ data ProcessCommand = ProcessCommand FilePath [String]
 runProcess :: ProcessCommand -> IO ExitCode
 runProcess (ProcessCommand command arguments) =
   rawSystem command arguments
+
+captureProcess :: ProcessCommand -> IO (ExitCode, String, String)
+captureProcess (ProcessCommand command arguments) =
+  readCreateProcessWithExitCode (proc command arguments) ""
+
+captureCommandOutput :: ProcessCommand -> IO (ExitCode, String)
+captureCommandOutput (ProcessCommand "" []) = pure (ExitSuccess, "")
+captureCommandOutput processCommand = do
+  (exitCode, standardOutput, standardError) <- captureProcess processCommand
+  hPutStr stderr standardError
+  pure (exitCode, trimTrailingNewlines standardOutput)
+
+trimTrailingNewlines :: String -> String
+trimTrailingNewlines =
+  reverse . dropWhile (== '\n') . reverse
 
 runPipeline :: [ProcessCommand] -> IO [ExitCode]
 runPipeline commands =

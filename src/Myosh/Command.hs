@@ -14,7 +14,7 @@ import Control.Exception
     catch,
     throwIO,
   )
-import Myosh.Process (ProcessCommand (..), runPipeline, runProcess)
+import Myosh.Process (ProcessCommand (..), captureCommandOutput, runPipeline, runProcess)
 import System.Directory (getCurrentDirectory, getHomeDirectory, setCurrentDirectory)
 import System.Exit (ExitCode (..))
 import System.IO (hPutStrLn, stderr)
@@ -57,7 +57,45 @@ initialShellState = ShellState {previousDirectory = Nothing}
 --------------------------------------------------------------------------------
 
 runCommand :: ShellState -> String -> IO CommandResult
-runCommand state input = executeCommand state (parseCommand input)
+runCommand state input =
+  catch
+    ( do
+        expanded <- expandInlineCommands input
+        case expanded of
+          Left message -> runInvalidCommand state message
+          Right commandLine -> executeCommand state (parseCommand commandLine)
+    )
+    (continueAfterInterrupt state)
+
+expandInlineCommands :: String -> IO (Either String String)
+expandInlineCommands "" = pure (Right "")
+expandInlineCommands ('`' : input) =
+  case break (== '`') input of
+    (_, "") -> pure (Left "syntax error: unmatched backtick")
+    (inlineCommand, _ : rest) -> do
+      expanded <- runCommandSubstitution (parseProcessCommand (words inlineCommand))
+      remaining <- expandInlineCommands rest
+      case remaining of
+        Left message -> pure (Left message)
+        Right commandLine -> pure (Right (expanded ++ commandLine))
+expandInlineCommands (char : input) = do
+  remaining <- expandInlineCommands input
+  case remaining of
+    Left message -> pure (Left message)
+    Right commandLine -> pure (Right (char : commandLine))
+
+runCommandSubstitution :: ProcessCommand -> IO String
+runCommandSubstitution processCommand@(ProcessCommand command _) =
+  catch
+    ( do
+        (exitCode, standardOutput) <- captureCommandOutput processCommand
+        reportExitCode exitCode
+        pure standardOutput
+    )
+    ( \err -> do
+        reportError command err
+        pure ""
+    )
 
 parseCommand :: String -> Command
 parseCommand input =
