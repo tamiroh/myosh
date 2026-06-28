@@ -62,19 +62,8 @@ initialShellState :: ShellState
 initialShellState = ShellState {previousDirectory = Nothing}
 
 --------------------------------------------------------------------------------
--- Command Line Parsing
+-- Command Line Expansion
 --------------------------------------------------------------------------------
-
-runCommand :: ShellState -> String -> IO CommandResult
-runCommand state input =
-  catch
-    ( do
-        expanded <- expandCommand (parseCommand input)
-        case expanded of
-          Left message -> runInvalidCommand state message
-          Right command -> executeCommand state command
-    )
-    (continueAfterInterrupt state)
 
 expandCommand :: Command -> IO (Either String Command)
 expandCommand Empty = pure (Right Empty)
@@ -148,6 +137,10 @@ parseCommandSubstitution :: String -> Either String ProcessCommand
 parseCommandSubstitution input =
   Right (processCommandFromWords (words input))
 
+--------------------------------------------------------------------------------
+-- Command Line Parsing
+--------------------------------------------------------------------------------
+
 parseCommand :: String -> Command
 parseCommand input =
   case parseTokens (lexCommandLine input) of
@@ -200,24 +193,9 @@ parseTokens tokens =
         then Left "syntax error near unexpected token `|'"
         else Pipeline <$> mapM parseSimpleCommand tokensByCommand
 
-parseBuiltinCommand :: [String] -> Either String Command
-parseBuiltinCommand tokens =
-  case tokens of
-    [] -> Right Empty
-    ["exit"] -> Right Exit
-    ["cd"] -> Right (ChangeDirectory HomeDirectory)
-    ["cd", "-"] -> Right (ChangeDirectory PreviousDirectory)
-    ["cd", path] -> Right (ChangeDirectory (DirectoryPath path))
-    "cd" : _ -> Right (Run "cd" [])
-    command : arguments -> Right (Run command arguments)
-
 parseSimpleCommand :: [Token] -> Either String SimpleCommand
 parseSimpleCommand tokens =
   SimpleCommand <$> wordTokens tokens
-
-processCommandFromWords :: [String] -> ProcessCommand
-processCommandFromWords [] = ProcessCommand "" []
-processCommandFromWords (command : arguments) = ProcessCommand command arguments
 
 wordTokens :: [Token] -> Either String [String]
 wordTokens =
@@ -237,8 +215,30 @@ splitToken token [] = [[token]]
 splitToken token (command : commands) = (token : command) : commands
 
 --------------------------------------------------------------------------------
--- Command Dispatch
+-- Command Line Execution
 --------------------------------------------------------------------------------
+
+runCommand :: ShellState -> String -> IO CommandResult
+runCommand state input =
+  catch
+    ( do
+        expanded <- expandCommand (parseCommand input)
+        case expanded of
+          Left message -> runInvalidCommand state message
+          Right command -> executeCommand state command
+    )
+    (continueAfterInterrupt state)
+
+parseBuiltinCommand :: [String] -> Either String Command
+parseBuiltinCommand tokens =
+  case tokens of
+    [] -> Right Empty
+    ["exit"] -> Right Exit
+    ["cd"] -> Right (ChangeDirectory HomeDirectory)
+    ["cd", "-"] -> Right (ChangeDirectory PreviousDirectory)
+    ["cd", path] -> Right (ChangeDirectory (DirectoryPath path))
+    "cd" : _ -> Right (Run "cd" [])
+    command : arguments -> Right (Run command arguments)
 
 executeCommand :: ShellState -> Command -> IO CommandResult
 executeCommand state Empty = runEmptyCommand state
@@ -340,6 +340,10 @@ runPipelineCommand state commands =
 processCommandFromSimpleCommand :: SimpleCommand -> ProcessCommand
 processCommandFromSimpleCommand (SimpleCommand wordsInCommand) =
   processCommandFromWords wordsInCommand
+
+processCommandFromWords :: [String] -> ProcessCommand
+processCommandFromWords [] = ProcessCommand "" []
+processCommandFromWords (command : arguments) = ProcessCommand command arguments
 
 --------------------------------------------------------------------------------
 -- Exit Status Reporting
