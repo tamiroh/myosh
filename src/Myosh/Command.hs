@@ -26,17 +26,26 @@ import System.IO.Error (ioeGetErrorString, isDoesNotExistError)
 
 data Command
   = Empty
+  | Simple SimpleCommand
   | Exit
   | ChangeDirectory DirectoryTarget
   | Run FilePath [String]
-  | Pipeline [ProcessCommand]
+  | Pipeline [SimpleCommand]
   | Invalid String
+  deriving (Eq, Show)
+
+newtype SimpleCommand = SimpleCommand [String]
   deriving (Eq, Show)
 
 data DirectoryTarget
   = HomeDirectory
   | PreviousDirectory
   | DirectoryPath FilePath
+  deriving (Eq, Show)
+
+data Token
+  = WordToken String
+  | PipeToken
   deriving (Eq, Show)
 
 newtype ShellState = ShellState
@@ -60,12 +69,47 @@ runCommand :: ShellState -> String -> IO CommandResult
 runCommand state input =
   catch
     ( do
-        expanded <- expandInlineCommands input
+        expanded <- expandCommand (parseCommand input)
         case expanded of
           Left message -> runInvalidCommand state message
-          Right commandLine -> executeCommand state (parseCommand commandLine)
+          Right command -> executeCommand state command
     )
     (continueAfterInterrupt state)
+
+expandCommand :: Command -> IO (Either String Command)
+expandCommand Empty = pure (Right Empty)
+expandCommand (Simple command) = expandSimpleCommand command
+expandCommand Exit = pure (Right Exit)
+expandCommand (ChangeDirectory target) =
+  fmap ChangeDirectory <$> expandDirectoryTarget target
+expandCommand (Run command arguments) =
+  fmap (uncurry Run) <$> expandCommandWords command arguments
+expandCommand (Pipeline commands) = do
+  expandedCommands <- mapM expandSimplePipelineCommand commands
+  pure (Pipeline <$> sequence expandedCommands)
+expandCommand (Invalid message) = pure (Right (Invalid message))
+
+expandDirectoryTarget :: DirectoryTarget -> IO (Either String DirectoryTarget)
+expandDirectoryTarget HomeDirectory = pure (Right HomeDirectory)
+expandDirectoryTarget PreviousDirectory = pure (Right PreviousDirectory)
+expandDirectoryTarget (DirectoryPath path) =
+  fmap DirectoryPath <$> expandInlineCommands path
+
+expandSimpleCommand :: SimpleCommand -> IO (Either String Command)
+expandSimpleCommand (SimpleCommand wordsInCommand) = do
+  expandedWords <- mapM expandInlineCommands wordsInCommand
+  pure (parseBuiltinCommand =<< sequence expandedWords)
+
+expandSimplePipelineCommand :: SimpleCommand -> IO (Either String SimpleCommand)
+expandSimplePipelineCommand (SimpleCommand wordsInCommand) = do
+  expandedWords <- mapM expandInlineCommands wordsInCommand
+  pure (SimpleCommand <$> sequence expandedWords)
+
+expandCommandWords :: FilePath -> [String] -> IO (Either String (FilePath, [String]))
+expandCommandWords command arguments = do
+  expandedCommand <- expandInlineCommands command
+  expandedArguments <- mapM expandInlineCommands arguments
+  pure ((,) <$> expandedCommand <*> sequence expandedArguments)
 
 expandInlineCommands :: String -> IO (Either String String)
 expandInlineCommands "" = pure (Right "")
@@ -73,11 +117,14 @@ expandInlineCommands ('`' : input) =
   case break (== '`') input of
     (_, "") -> pure (Left "syntax error: unmatched backtick")
     (inlineCommand, _ : rest) -> do
-      expanded <- runCommandSubstitution (parseProcessCommand (words inlineCommand))
-      remaining <- expandInlineCommands rest
-      case remaining of
+      case parseCommandSubstitution inlineCommand of
         Left message -> pure (Left message)
-        Right commandLine -> pure (Right (expanded ++ commandLine))
+        Right processCommand -> do
+          expanded <- runCommandSubstitution processCommand
+          remaining <- expandInlineCommands rest
+          case remaining of
+            Left message -> pure (Left message)
+            Right commandLine -> pure (Right (expanded ++ commandLine))
 expandInlineCommands (char : input) = do
   remaining <- expandInlineCommands input
   case remaining of
@@ -97,37 +144,95 @@ runCommandSubstitution processCommand@(ProcessCommand command _) =
         pure ""
     )
 
+parseCommandSubstitution :: String -> Either String ProcessCommand
+parseCommandSubstitution input =
+  Right (processCommandFromWords (words input))
+
 parseCommand :: String -> Command
 parseCommand input =
-  case splitPipeline (words input) of
-    [] -> Empty
-    [tokens] -> parseBuiltinCommand tokens
+  case parseTokens (lexCommandLine input) of
+    Left message -> Invalid message
+    Right command -> command
+
+lexCommandLine :: String -> [Token]
+lexCommandLine =
+  lexTokens [] Nothing
+
+lexTokens :: [Token] -> Maybe String -> String -> [Token]
+lexTokens tokens Nothing "" = reverse tokens
+lexTokens tokens (Just word) "" = reverse (lexWord word : tokens)
+lexTokens tokens Nothing (char : input)
+  | isShellSpace char = lexTokens tokens Nothing input
+  | char == '`' = lexTokens tokens (Just (readBacktickWord input)) (dropBacktickWord input)
+  | otherwise = lexTokens tokens (Just [char]) input
+lexTokens tokens (Just word) (char : input)
+  | isShellSpace char = lexTokens (lexWord word : tokens) Nothing input
+  | char == '`' =
+      lexTokens tokens (Just (word ++ readBacktickWord input)) (dropBacktickWord input)
+  | otherwise = lexTokens tokens (Just (word ++ [char])) input
+
+readBacktickWord :: String -> String
+readBacktickWord input =
+  case break (== '`') input of
+    (inlineCommand, "") -> '`' : inlineCommand
+    (inlineCommand, _) -> '`' : inlineCommand ++ "`"
+
+dropBacktickWord :: String -> String
+dropBacktickWord input =
+  case break (== '`') input of
+    (_, "") -> ""
+    (_, _ : rest) -> rest
+
+isShellSpace :: Char -> Bool
+isShellSpace char = char `elem` [' ', '\t', '\n']
+
+lexWord :: String -> Token
+lexWord "|" = PipeToken
+lexWord word = WordToken word
+
+parseTokens :: [Token] -> Either String Command
+parseTokens tokens =
+  case splitPipeline tokens of
+    [] -> Right Empty
+    [commandTokens] -> Simple <$> parseSimpleCommand commandTokens
     tokensByCommand ->
       if any null tokensByCommand
-        then Invalid "syntax error near unexpected token `|'"
-        else Pipeline (map parseProcessCommand tokensByCommand)
+        then Left "syntax error near unexpected token `|'"
+        else Pipeline <$> mapM parseSimpleCommand tokensByCommand
 
-parseBuiltinCommand :: [String] -> Command
+parseBuiltinCommand :: [String] -> Either String Command
 parseBuiltinCommand tokens =
   case tokens of
-    [] -> Empty
-    ["exit"] -> Exit
-    ["cd"] -> ChangeDirectory HomeDirectory
-    ["cd", "-"] -> ChangeDirectory PreviousDirectory
-    ["cd", path] -> ChangeDirectory (DirectoryPath path)
-    "cd" : _ -> Run "cd" []
-    command : arguments -> Run command arguments
+    [] -> Right Empty
+    ["exit"] -> Right Exit
+    ["cd"] -> Right (ChangeDirectory HomeDirectory)
+    ["cd", "-"] -> Right (ChangeDirectory PreviousDirectory)
+    ["cd", path] -> Right (ChangeDirectory (DirectoryPath path))
+    "cd" : _ -> Right (Run "cd" [])
+    command : arguments -> Right (Run command arguments)
 
-parseProcessCommand :: [String] -> ProcessCommand
-parseProcessCommand [] = ProcessCommand "" []
-parseProcessCommand (command : arguments) = ProcessCommand command arguments
+parseSimpleCommand :: [Token] -> Either String SimpleCommand
+parseSimpleCommand tokens =
+  SimpleCommand <$> wordTokens tokens
 
-splitPipeline :: [String] -> [[String]]
+processCommandFromWords :: [String] -> ProcessCommand
+processCommandFromWords [] = ProcessCommand "" []
+processCommandFromWords (command : arguments) = ProcessCommand command arguments
+
+wordTokens :: [Token] -> Either String [String]
+wordTokens =
+  mapM wordToken
+
+wordToken :: Token -> Either String String
+wordToken (WordToken word) = Right word
+wordToken PipeToken = Left "syntax error near unexpected token `|'"
+
+splitPipeline :: [Token] -> [[Token]]
 splitPipeline =
   foldr splitToken [[]]
 
-splitToken :: String -> [[String]] -> [[String]]
-splitToken "|" commands = [] : commands
+splitToken :: Token -> [[Token]] -> [[Token]]
+splitToken PipeToken commands = [] : commands
 splitToken token [] = [[token]]
 splitToken token (command : commands) = (token : command) : commands
 
@@ -137,6 +242,10 @@ splitToken token (command : commands) = (token : command) : commands
 
 executeCommand :: ShellState -> Command -> IO CommandResult
 executeCommand state Empty = runEmptyCommand state
+executeCommand state (Simple (SimpleCommand wordsInCommand)) =
+  case parseBuiltinCommand wordsInCommand of
+    Left message -> runInvalidCommand state message
+    Right command -> executeCommand state command
 executeCommand _ Exit = runExitCommand
 executeCommand state (ChangeDirectory target) =
   runChangeDirectoryCommand state target
@@ -216,14 +325,21 @@ runExternalCommand state command arguments =
 -- Command / Pipeline
 --------------------------------------------------------------------------------
 
-runPipelineCommand :: ShellState -> [ProcessCommand] -> IO CommandResult
+runPipelineCommand :: ShellState -> [SimpleCommand] -> IO CommandResult
 runPipelineCommand state commands =
   catch
     ( catch
-        (runPipeline commands >>= mapM_ reportExitCode >> pure (Continue state))
+        ( runPipeline (map processCommandFromSimpleCommand commands)
+            >>= mapM_ reportExitCode
+            >> pure (Continue state)
+        )
         (continueAfterError state "pipeline")
     )
     (continueAfterInterrupt state)
+
+processCommandFromSimpleCommand :: SimpleCommand -> ProcessCommand
+processCommandFromSimpleCommand (SimpleCommand wordsInCommand) =
+  processCommandFromWords wordsInCommand
 
 --------------------------------------------------------------------------------
 -- Exit Status Reporting
